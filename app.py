@@ -2,8 +2,11 @@
 """
 SISTEM REKOD SURAT DOKUMEN KELUAR - PEJABAT REKTOR UiTM CAWANGAN SABAH 2026
 Flask + Supabase (PostgreSQL + Storage) untuk Render
+PIN pengambilan dijana semasa surat direkodkan (disimpan sebagai hash).
 """
 import base64
+import hashlib
+import hmac
 import io
 import os
 import re
@@ -24,7 +27,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from flask import (Flask, Response, abort, flash, g, redirect, render_template,
                    request, send_file, session, url_for)
 from jinja2 import DictLoader
-from markupsafe import Markup, escape
+from markupsafe import Markup
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -40,13 +43,14 @@ try:
 except ImportError:
     pass
 
-TZ = timezone(timedelta(hours=8))  # Malaysia (tiada DST, tak perlu tzdata)
+TZ = timezone(timedelta(hours=8))  # Malaysia (tiada DST)
 
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 PROD = os.environ.get("RENDER") == "true" or BASE_URL.startswith("https")
 DEBUG = os.environ.get("FLASK_DEBUG", "0") == "1" and not PROD
 SEED_DEMO = os.environ.get("SEED_DEMO", "0") == "1"
 PROXY_HOPS = int(os.environ.get("PROXY_HOPS", "1" if PROD else "0"))
+ALLOW_INDEX = os.environ.get("ALLOW_INDEX", "0") == "1"   # benarkan Google index halaman utama
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_SSLMODE = os.environ.get("DB_SSLMODE", "require")
@@ -56,6 +60,11 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "surat-gambar")
 STORAGE_ON = bool(SUPABASE_URL and SUPABASE_KEY)
 
+try:
+    PIN_PANJANG = min(8, max(4, int(os.environ.get("PIN_PANJANG", "4"))))
+except ValueError:
+    PIN_PANJANG = 4
+
 
 def _fatal(msg):
     if PROD:
@@ -63,13 +72,11 @@ def _fatal(msg):
     print("⚠️  AMARAN:", msg, file=sys.stderr)
 
 
-# --- SECRET_KEY ---
 SECRET_KEY = os.environ.get("SECRET_KEY", "")
 if not SECRET_KEY or len(SECRET_KEY) < 32:
     _fatal("SECRET_KEY mesti ditetapkan (min 32 aksara).")
     SECRET_KEY = secrets.token_hex(32)  # sementara (dev sahaja)
 
-# --- Kata laluan admin (utamakan HASH) ---
 _hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
 _plain = os.environ.get("ADMIN_PASSWORD", "")
 if _hash:
@@ -116,7 +123,6 @@ STATUS_META = {
 
 SIG_RE = re.compile(r"data:image/png;base64,[A-Za-z0-9+/=]+")
 ID_RE = re.compile(r"[A-Z0-9][A-Z0-9/.\-]{2,29}")
-TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{10,64}")
 
 ADA_LOGO = os.path.exists(os.path.join(BASE_DIR, "static", "img", "logo.png"))
 ADA_BANNER = os.path.exists(os.path.join(BASE_DIR, "static", "img", "banner.jpg"))
@@ -203,8 +209,15 @@ def init_db():
                     tandatangan TEXT,
                     disahkan_oleh TEXT,
                     gambar TEXT,
+                    pin_hash TEXT,
                     token TEXT NOT NULL UNIQUE
                 )""")
+            # Migrasi (data lama kekal)
+            cur.execute("ALTER TABLE surat ADD COLUMN IF NOT EXISTS gambar TEXT")
+            cur.execute("ALTER TABLE surat ADD COLUMN IF NOT EXISTS pin_hash TEXT")
+            # Buang lajur PIN teks-biasa daripada versi lama (jika ada)
+            cur.execute("ALTER TABLE surat DROP COLUMN IF EXISTS pin, "
+                        "DROP COLUMN IF EXISTS pin_tamat")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_surat_noid ON surat(no_id)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS had_cubaan (
@@ -221,8 +234,7 @@ def init_db():
                     butiran TEXT,
                     ip TEXT
                 )""")
-            # PENTING: halang akses melalui API awam Supabase (anon key).
-            # Aplikasi ini guna sambungan Postgres terus (peranan postgres melepasi RLS).
+            # Halang akses melalui API awam Supabase (anon key).
             for t in ("surat", "had_cubaan", "audit"):
                 cur.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
 
@@ -269,6 +281,19 @@ def audit(tindakan, butiran=""):
     laksana("INSERT INTO audit (tindakan, butiran, ip) VALUES (%s,%s,%s)",
             (tindakan, (butiran or "")[:500], klien_ip()))
     get_db().commit()
+
+
+# ----------------------------------------------------------------------
+# PIN PENGAMBILAN (dijana semasa surat direkod, disimpan sebagai hash)
+# ----------------------------------------------------------------------
+def jana_pin():
+    return f"{secrets.randbelow(10 ** PIN_PANJANG):0{PIN_PANJANG}d}"
+
+
+def hash_pin(sid, pin):
+    """HMAC dengan SECRET_KEY + id surat (PIN sama pada dua surat -> hash berbeza)."""
+    return hmac.new(SECRET_KEY.encode(), f"pin:{sid}:{pin}".encode(),
+                    hashlib.sha256).hexdigest()
 
 
 # ----------------------------------------------------------------------
@@ -415,7 +440,8 @@ def header_keselamatan(resp):
     resp.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
     if PROD:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    if request.path.startswith(("/admin", "/sahkan")):
+    if (request.path.startswith(("/admin", "/sahkan"))
+            or (request.path == "/" and request.args.get("no_id"))):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -443,7 +469,8 @@ def next_selamat(n):
 MESEJ = {
     400: "Permintaan tidak sah.", 403: "Akses ditolak.", 404: "Halaman tidak dijumpai.",
     413: "Fail terlalu besar (maksimum 6 MB).", 429: "Terlalu banyak permintaan.",
-    500: "Ralat pelayan. Sila cuba lagi.", 502: "Gagal mendapatkan gambar dari storan.",
+    500: "Ralat pelayan. Sila cuba lagi.", 501: "Ciri ini belum dipasang.",
+    502: "Gagal mendapatkan gambar dari storan.",
     503: "Perkhidmatan tidak tersedia seketika.",
 }
 
@@ -495,7 +522,8 @@ def topeng(nama):
 app.jinja_env.globals.update(
     badge=badge, csrf_token=csrf_token, STATUS_LIST=STATUS_LIST,
     STATUS_META=STATUS_META, nonce=lambda: g.get("nonce", ""),
-    ADA_LOGO=ADA_LOGO, ADA_BANNER=ADA_BANNER, STORAGE_ON=STORAGE_ON)
+    ADA_LOGO=ADA_LOGO, ADA_BANNER=ADA_BANNER, STORAGE_ON=STORAGE_ON,
+    PIN_PANJANG=PIN_PANJANG, ALLOW_INDEX=ALLOW_INDEX)
 app.jinja_env.filters.update(tgl=tgl, tgl_masa=tgl_masa, topeng=topeng)
 
 
@@ -505,6 +533,28 @@ app.jinja_env.filters.update(tgl=tgl, tgl_masa=tgl_masa, topeng=topeng)
 @app.route("/healthz")
 def healthz():
     return "ok"
+
+
+@app.route("/robots.txt")
+def robots():
+    if ALLOW_INDEX:
+        txt = "User-agent: *\nDisallow: /admin\nDisallow: /sahkan\nAllow: /\n"
+    else:
+        txt = "User-agent: *\nDisallow: /\n"
+    return Response(txt, mimetype="text/plain")
+
+
+@app.route("/qr.png")
+def qr_laman():
+    """QR ke halaman utama tapak (alamat dikesan automatik, tidak perlu BASE_URL)."""
+    try:
+        import qrcode
+    except ImportError:
+        abort(501)
+    buf = io.BytesIO()
+    qrcode.make(url_for("index", _external=True)).save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png", max_age=86400)
 
 
 @app.route("/")
@@ -521,52 +571,70 @@ def index():
                 return render_template("index.html", no_id=no_id, senarai=None), 429
             catat(kunci)
             senarai = tanya("""SELECT no_siri, no_rujukan, tarikh_surat, perkara, nama,
-                                      no_id, jenis, status, tarikh_kemaskini, tarikh_ambil
+                                      jenis, status, tarikh_kemaskini, tarikh_ambil
                                FROM surat WHERE no_id=%s ORDER BY id DESC LIMIT 50""",
                             (no_id,))
     return render_template("index.html", no_id=no_id, senarai=senarai)
 
 
-@app.route("/sahkan/<token>", methods=["GET", "POST"])
-def sahkan(token):
-    """Pengesahan pengambilan: dicapai melalui QR yang ditunjukkan di kaunter."""
-    if not TOKEN_RE.fullmatch(token):
-        abort(404)
-    s = tanya("SELECT * FROM surat WHERE token=%s", (token,), one=True)
-    if not s:
-        abort(404)
+@app.route("/sahkan/<token>")
+def sahkan_lama(token):
+    """Keserasian QR lama -> halaman pengesahan baharu."""
+    return redirect(url_for("sahkan"))
 
-    if request.method == "POST":
-        if s["status"] != "Surat Keluar":
-            flash("Surat ini tidak berada pada status 'Surat Keluar'.", "warning")
-            return redirect(url_for("sahkan", token=token))
 
-        k_ip = f"sahkan:{klien_ip()}:{token}"
-        k_tok = f"sahkan-token:{token}"
-        baki = terkunci(k_ip, 5, 300) or terkunci(k_tok, 10, 900)
-        if baki:
-            flash(f"Terlalu banyak cubaan salah. Cuba lagi dalam {baki} minit.", "danger")
-            return redirect(url_for("sahkan", token=token))
+@app.route("/sahkan", methods=["GET", "POST"])
+def sahkan():
+    """Penerima masukkan No. ID + PIN (yang diberi semasa menyerahkan surat)."""
+    if request.method == "GET":
+        no_id = request.args.get("no_id", "").strip().upper()
+        return render_template("sahkan.html", no_id=no_id if ID_RE.fullmatch(no_id) else "")
 
-        input_id = request.form.get("no_id", "").strip().upper()
-        if not secrets.compare_digest(input_id.encode(), s["no_id"].upper().encode()):
-            catat(k_ip)
-            catat(k_tok)
-            flash("No. Pelajar/Staf tidak sepadan. Pengesahan gagal.", "danger")
-            return redirect(url_for("sahkan", token=token))
+    no_id = request.form.get("no_id", "").strip().upper()
+    pin = re.sub(r"\D", "", request.form.get("pin", ""))
+    if not ID_RE.fullmatch(no_id) or len(pin) != PIN_PANJANG:
+        flash(f"Sila masukkan No. Pelajar/Staf yang sah dan PIN {PIN_PANJANG} digit.", "warning")
+        return render_template("sahkan.html", no_id=no_id if ID_RE.fullmatch(no_id) else "")
 
-        sig = sah_tandatangan(request.form.get("tandatangan", ""))
-        n = laksana("""UPDATE surat SET status='Selesai', tarikh_kemaskini=now(),
-                       tarikh_ambil=now(), tandatangan=%s, disahkan_oleh='Penerima'
-                       WHERE id=%s AND status='Surat Keluar'""", (sig, s["id"]))
-        get_db().commit()
-        if n:
-            kosongkan(k_ip)
-            audit("pengesahan_penerima", f"No. Siri {s['no_siri']}")
-            flash("Terima kasih! Pengambilan surat telah disahkan. ✅", "success")
-        return redirect(url_for("index", no_id=s["no_id"]))
+    k_ip = f"sahkan-ip:{klien_ip()}"
+    k_id = f"sahkan-id:{no_id}"
+    baki = terkunci(k_ip, 10, 900) or terkunci(k_id, 5, 1800)
+    if baki:
+        flash(f"Terlalu banyak cubaan salah. Cuba lagi dalam {baki} minit, "
+              "atau hubungi pejabat.", "danger")
+        return render_template("sahkan.html", no_id=no_id), 429
 
-    return render_template("sahkan.html", s=s)
+    rows = tanya("""SELECT id, no_siri, perkara, pin_hash FROM surat
+                    WHERE no_id=%s AND status='Surat Keluar' AND pin_hash IS NOT NULL
+                    LIMIT 50""", (no_id,))
+    padan = None
+    for r in rows:   # tiada 'break' supaya masa semakan lebih seragam
+        ok = hmac.compare_digest(hash_pin(r["id"], pin), r["pin_hash"])
+        if ok and padan is None:
+            padan = r
+
+    if padan is None:
+        catat(k_ip)
+        catat(k_id)
+        # Mesej sama sama ada ID wujud atau tidak (elak enumerasi)
+        flash("No. ID atau PIN tidak betul, atau tiada surat yang sedia diambil.", "danger")
+        return render_template("sahkan.html", no_id=no_id)
+
+    sig = sah_tandatangan(request.form.get("tandatangan", ""))
+    # Atomik: sekali guna sahaja
+    n = laksana("""UPDATE surat SET status='Selesai', tarikh_kemaskini=now(),
+                   tarikh_ambil=now(), tandatangan=%s, disahkan_oleh='Penerima (PIN)',
+                   pin_hash=NULL
+                   WHERE id=%s AND status='Surat Keluar' AND pin_hash=%s""",
+                (sig, padan["id"], padan["pin_hash"]))
+    get_db().commit()
+    if not n:
+        flash("Pengesahan tidak dapat diselesaikan. Sila cuba semula.", "warning")
+        return render_template("sahkan.html", no_id=no_id)
+
+    kosongkan(k_id)
+    audit("pengesahan_penerima", f"No. Siri {padan['no_siri']} (PIN)")
+    return render_template("selesai.html", s=padan, masa=now())
 
 
 # ----------------------------------------------------------------------
@@ -608,7 +676,10 @@ def admin_logout():
 def query_surat(had=300):
     q_ = request.args.get("q", "").strip()[:100]
     st = request.args.get("status", "").strip()
-    sql, args = "SELECT * FROM surat WHERE TRUE", []
+    sql, args = """SELECT id, no_siri, no_rujukan, tarikh_surat, perkara, nama, no_id,
+                          jenis, status, tarikh_kemaskini, tarikh_ambil, tandatangan,
+                          disahkan_oleh, gambar, (pin_hash IS NOT NULL) AS ada_pin
+                   FROM surat WHERE TRUE""", []
     if q_:
         like = "%" + re.sub(r"([\\%_])", r"\\\1", q_) + "%"
         sql += """ AND (no_siri ILIKE %s OR no_rujukan ILIKE %s OR perkara ILIKE %s
@@ -636,6 +707,12 @@ def admin():
 def admin_cetak():
     rows, _, _ = query_surat(had=2000)
     return render_template("cetak.html", rows=rows, tarikh=now())
+
+
+@app.route("/admin/poster")
+@admin_required
+def admin_poster():
+    return render_template("poster.html", laman=url_for("index", _external=True))
 
 
 @app.route("/admin/log")
@@ -678,7 +755,7 @@ def sah_borang(d):
 def _status_sql(baru):
     """Potongan SQL statik (tiada input pengguna) bila status ditukar."""
     if baru == "Selesai":
-        return ", tarikh_ambil=now(), disahkan_oleh='Admin'"
+        return ", tarikh_ambil=now(), disahkan_oleh='Admin', pin_hash=NULL"
     return ", tarikh_ambil=NULL, tandatangan=NULL, disahkan_oleh=NULL"
 
 
@@ -699,18 +776,23 @@ def admin_tambah():
         if not err:
             nama_g = f"{uuid.uuid4().hex}.jpg" if img else None
             try:
-                laksana("""INSERT INTO surat (no_siri,no_rujukan,tarikh_surat,perkara,nama,
-                           no_id,jenis,status,gambar,token)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (d["no_siri"], d["no_rujukan"], d["tarikh_surat"], d["perkara"],
-                         d["nama"], d["no_id"], d["jenis"], d["status"], nama_g,
-                         secrets.token_urlsafe(12)))
+                with get_db().cursor() as cur:
+                    cur.execute("""INSERT INTO surat (no_siri,no_rujukan,tarikh_surat,perkara,
+                                   nama,no_id,jenis,status,gambar,token)
+                                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                                (d["no_siri"], d["no_rujukan"], d["tarikh_surat"], d["perkara"],
+                                 d["nama"], d["no_id"], d["jenis"], d["status"], nama_g,
+                                 secrets.token_urlsafe(12)))
+                    sid = cur.fetchone()["id"]
+                pin = jana_pin()
+                laksana("UPDATE surat SET pin_hash=%s WHERE id=%s", (hash_pin(sid, pin), sid))
                 if img:
                     storage_upload(nama_g, img)
                 get_db().commit()
                 audit("tambah", f"No. Siri {d['no_siri']}")
-                flash("Rekod surat berjaya ditambah.", "success")
-                return redirect(url_for("admin"))
+                # Papar slip PIN terus (PIN tidak disimpan di mana-mana dalam bentuk asal)
+                return render_template("slip.html", s=d, pin=pin,
+                                       laman=url_for("index", _external=True))
             except psycopg2.errors.UniqueViolation:
                 get_db().rollback()
                 err = "No. Siri sudah wujud."
@@ -751,6 +833,11 @@ def admin_edit(sid):
             elif request.form.get("buang_gambar") == "1":
                 gambar_baru = None
             extra = _status_sql(d["status"]) if d["status"] != lama["status"] else ""
+            pin_batal = False
+            if d["no_id"] != lama["no_id"]:       # No. ID berubah -> PIN lama batal
+                if "pin_hash" not in extra:
+                    extra += ", pin_hash=NULL"
+                pin_batal = True
             try:
                 laksana(f"""UPDATE surat SET no_siri=%s,no_rujukan=%s,tarikh_surat=%s,
                             perkara=%s,nama=%s,no_id=%s,jenis=%s,status=%s,
@@ -763,7 +850,9 @@ def admin_edit(sid):
                 if lama["gambar"] and gambar_baru != lama["gambar"]:
                     storage_delete_senyap(lama["gambar"])
                 audit("edit", f"No. Siri {d['no_siri']}")
-                flash("Rekod dikemas kini.", "success")
+                flash("Rekod dikemas kini." + (
+                    " No. ID ditukar, jadi PIN lama dibatalkan. Tekan butang 🔑 PIN "
+                    "untuk jana PIN baharu." if pin_batal else ""), "success")
                 return redirect(url_for("admin"))
             except psycopg2.errors.UniqueViolation:
                 get_db().rollback()
@@ -795,6 +884,24 @@ def admin_status(sid):
     return redirect(url_for("admin"))
 
 
+@app.route("/admin/pin/<int:sid>", methods=["POST"])
+@admin_required
+def admin_pin(sid):
+    """Jana PIN baharu (PIN lama tidak sah lagi) dan papar slip."""
+    s = tanya("SELECT id, no_siri, perkara, nama, no_id, status FROM surat WHERE id=%s",
+              (sid,), one=True)
+    if not s:
+        abort(404)
+    if s["status"] == "Selesai":
+        flash("Surat ini sudah diambil. PIN tidak diperlukan.", "info")
+        return redirect(url_for("admin"))
+    pin = jana_pin()
+    laksana("UPDATE surat SET pin_hash=%s WHERE id=%s", (hash_pin(sid, pin), sid))
+    get_db().commit()
+    audit("jana_pin", f"No. Siri {s['no_siri']}")
+    return render_template("slip.html", s=s, pin=pin, laman=url_for("index", _external=True))
+
+
 @app.route("/admin/padam/<int:sid>", methods=["POST"])
 @admin_required
 def admin_padam(sid):
@@ -824,22 +931,6 @@ def admin_gambar(sid):
                              "X-Content-Type-Options": "nosniff"})
 
 
-@app.route("/admin/qr/<int:sid>")
-@admin_required
-def admin_qr(sid):
-    """QR yang membuka halaman pengesahan. Tunjuk kepada penerima di kaunter."""
-    import qrcode
-    s = tanya("SELECT token FROM surat WHERE id=%s", (sid,), one=True)
-    if not s:
-        abort(404)
-    path = url_for("sahkan", token=s["token"])
-    url = (BASE_URL + path) if BASE_URL else url_for("sahkan", token=s["token"], _external=True)
-    buf = io.BytesIO()
-    qrcode.make(url).save(buf, format="PNG")
-    buf.seek(0)
-    return send_file(buf, mimetype="image/png")
-
-
 # ----------------------------------------------------------------------
 # TEMPLATE HTML
 # ----------------------------------------------------------------------
@@ -849,7 +940,7 @@ TEMPLATES["base.html"] = """<!doctype html>
 <html lang="ms"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
+{% block robots %}<meta name="robots" content="noindex,nofollow">{% endblock %}
 <title>{% block title %}Rekod Surat – Pejabat Rektor UiTM Cawangan Sabah 2026{% endblock %}</title>
 {% if ADA_LOGO %}<link rel="icon" href="{{ url_for('static', filename='img/logo.png') }}">{% endif %}
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"
@@ -860,6 +951,9 @@ TEMPLATES["base.html"] = """<!doctype html>
  .sig{border:2px dashed #999;border-radius:8px;background:#fff;width:100%;height:180px;touch-action:none}
  .table td,.table th{vertical-align:middle}
  .kad-surat{border-left:6px solid #0d6efd}
+ .pin-kotak{background:#fff8e1;border:2px dashed #f0ad00;border-radius:10px;text-align:center;padding:1rem}
+ .pin-nombor{font-size:3rem;font-weight:800;letter-spacing:.7rem;font-family:monospace;color:#4b1d6b}
+ @media print{body{background:#fff}}
 </style>
 </head><body>
 <nav class="navbar navbar-dark mb-3 d-print-none"><div class="container-fluid">
@@ -869,6 +963,7 @@ TEMPLATES["base.html"] = """<!doctype html>
   <div>
   {% if session.get('admin') %}
     <a class="btn btn-sm btn-outline-light" href="{{ url_for('admin') }}">Admin</a>
+    <a class="btn btn-sm btn-outline-light" href="{{ url_for('admin_poster') }}">📱 Poster QR</a>
     <a class="btn btn-sm btn-outline-light" href="{{ url_for('admin_log') }}">Log</a>
     <form class="d-inline" method="post" action="{{ url_for('admin_logout') }}">
       <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
@@ -906,6 +1001,10 @@ TEMPLATES["ralat.html"] = """{% extends 'base.html' %}
 {% endblock %}"""
 
 TEMPLATES["index.html"] = """{% extends 'base.html' %}
+{% block robots %}{% if ALLOW_INDEX and not no_id %}
+<meta name="robots" content="index,follow">
+<meta name="description" content="Semak status surat keluar Pejabat Rektor UiTM Cawangan Sabah.">
+{% else %}<meta name="robots" content="noindex,nofollow">{% endif %}{% endblock %}
 {% block content %}
 <div class="row justify-content-center"><div class="col-lg-8">
  {% if ADA_BANNER %}<img class="w-100 rounded shadow-sm mb-3" alt="UiTM Cawangan Sabah"
@@ -918,6 +1017,9 @@ TEMPLATES["index.html"] = """{% extends 'base.html' %}
            value="{{ no_id }}" required autofocus maxlength="30" autocomplete="off">
     <button class="btn btn-primary">🔍 Semak</button>
   </form>
+  <div class="mt-3">
+    <a class="btn btn-outline-success btn-sm" href="{{ url_for('sahkan', no_id=no_id) if no_id else url_for('sahkan') }}">
+      ✍️ Sudah ambil surat? Sahkan pengambilan (guna PIN)</a></div>
  </div></div>
 
  {% if senarai is not none %}
@@ -942,9 +1044,12 @@ TEMPLATES["index.html"] = """{% extends 'base.html' %}
         {% if s.tarikh_ambil %}<div>✅ Diambil: {{ s.tarikh_ambil|tgl_masa }}</div>{% endif %}
       </div>
       {% if s.status == 'Surat Keluar' %}
-        <div class="alert alert-info mt-3 mb-0 py-2 small">
-          Surat anda sudah siap. Sila ambil di <b>kaunter Pejabat Rektor</b> dan
-          imbas <b>kod QR</b> yang ditunjukkan oleh petugas untuk mengesahkan pengambilan.</div>
+        <div class="alert alert-info mt-3 mb-2 py-2 small">
+          Surat anda sudah siap. Sila ambil di <b>kaunter Pejabat Rektor</b> bersama
+          <b>kad matrik / kad staf</b>. Kemudian sahkan pengambilan menggunakan
+          <b>PIN {{ PIN_PANJANG }} digit</b> yang diberikan semasa anda menyerahkan permohonan.</div>
+        <a class="btn btn-success w-100" href="{{ url_for('sahkan', no_id=no_id) }}">
+          ✍️ Sahkan Pengambilan (guna PIN)</a>
       {% endif %}
     </div></div>
    {% endfor %}
@@ -957,18 +1062,23 @@ TEMPLATES["sahkan.html"] = """{% extends 'base.html' %}
 {% block content %}
 <div class="row justify-content-center"><div class="col-lg-6">
  <div class="card shadow-sm"><div class="card-body">
-  <h4>Pengesahan Pengambilan Surat</h4>
-  <p class="mb-1"><b>No. Siri:</b> {{ s.no_siri }}</p>
-  <p class="mb-1"><b>Rujukan:</b> {{ s.no_rujukan }}</p>
-  <p><b>Status:</b> {{ badge(s.status) }}</p>
-
-  {% if s.status == 'Surat Keluar' %}
-  <form method="post" id="frm">
+  <h4>✍️ Pengesahan Pengambilan Surat</h4>
+  <p class="text-muted small">Lakukan ini <b>di kaunter</b> semasa menerima surat. Petugas akan
+    menyemak kad matrik / kad staf anda.</p>
+  <form method="post" id="frm" autocomplete="off">
     <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
     <input type="hidden" name="tandatangan" id="tt">
     <div class="mb-3">
-      <label class="form-label">Masukkan semula No. Pelajar / No. Staf anda</label>
-      <input name="no_id" class="form-control form-control-lg" required autocomplete="off" maxlength="30">
+      <label class="form-label">No. Pelajar / No. Staf</label>
+      <input name="no_id" class="form-control form-control-lg" required maxlength="30"
+             value="{{ no_id }}" placeholder="cth: 2022123456 / STAF001">
+    </div>
+    <div class="mb-3">
+      <label class="form-label">PIN {{ PIN_PANJANG }} digit (daripada slip anda)</label>
+      <input name="pin" type="password" class="form-control form-control-lg text-center" required
+             inputmode="numeric" pattern="[0-9]*" maxlength="{{ PIN_PANJANG }}" autocomplete="off"
+             style="letter-spacing:.6rem;font-size:1.8rem" placeholder="••••">
+      <div class="form-text">Hilang PIN? Minta petugas kaunter jana PIN baharu.</div>
     </div>
     <div class="mb-2">
       <label class="form-label">Tandatangan digital (pilihan)</label>
@@ -977,12 +1087,7 @@ TEMPLATES["sahkan.html"] = """{% extends 'base.html' %}
     </div>
     <button class="btn btn-success btn-lg w-100 mt-3">✅ Saya Sahkan Telah Menerima Surat</button>
   </form>
-  {% elif s.status == 'Selesai' %}
-    <div class="alert alert-success">Surat ini telah diambil pada <b>{{ s.tarikh_ambil|tgl_masa }}</b>.</div>
-  {% else %}
-    <div class="alert alert-warning">Surat belum sedia untuk diambil.</div>
-  {% endif %}
-  <a href="{{ url_for('index') }}" class="btn btn-link">← Kembali</a>
+  <a href="{{ url_for('index') }}" class="btn btn-link mt-2">← Kembali</a>
  </div></div>
 </div></div>
 {% endblock %}
@@ -1002,6 +1107,72 @@ if(c){
     if(dirty)document.getElementById('tt').value=c.toDataURL('image/png');});
 }
 </script>
+{% endblock %}"""
+
+TEMPLATES["selesai.html"] = """{% extends 'base.html' %}
+{% block content %}
+<div class="row justify-content-center"><div class="col-lg-6">
+ <div class="card border-success border-3 shadow-sm text-center"><div class="card-body py-4">
+  <div style="font-size:4rem">✅</div>
+  <h3 class="text-success">Pengambilan Disahkan</h3>
+  <p class="mb-1"><b>No. Siri:</b> {{ s.no_siri }}</p>
+  <p class="mb-1">{{ s.perkara }}</p>
+  <p class="text-muted">{{ masa.strftime('%d/%m/%Y %I:%M %p') }}</p>
+  <div class="alert alert-light border small">Tunjukkan skrin ini kepada petugas kaunter.</div>
+  <a class="btn btn-outline-primary" href="{{ url_for('index') }}">Halaman Utama</a>
+ </div></div>
+</div></div>
+{% endblock %}"""
+
+TEMPLATES["slip.html"] = """{% extends 'base.html' %}
+{% block content %}
+<div class="row justify-content-center"><div class="col-lg-6">
+ <div class="alert alert-warning d-print-none">
+   <b>Simpan / cetak slip ini sekarang.</b> PIN hanya dipaparkan sekali dan tidak boleh dilihat semula.
+   Jika hilang, tekan butang 🔑 PIN pada rekod untuk jana PIN baharu.</div>
+ <div class="card shadow-sm"><div class="card-body text-center">
+  {% if ADA_LOGO %}<img src="{{ url_for('static', filename='img/logo.png') }}" alt="" height="55" class="mb-2"><br>{% endif %}
+  <h5 class="mb-0">SLIP PIN PENGAMBILAN SURAT</h5>
+  <div class="small mb-3">Pejabat Rektor UiTM Cawangan Sabah</div>
+  <table class="table table-sm text-start">
+    <tr><th style="width:35%">No. Siri</th><td>{{ s.no_siri }}</td></tr>
+    <tr><th>Perkara</th><td>{{ s.perkara }}</td></tr>
+    <tr><th>Penerima</th><td>{{ s.nama }}</td></tr>
+    <tr><th>No. Pelajar/Staf</th><td>{{ s.no_id }}</td></tr>
+  </table>
+  <div class="pin-kotak">
+    <div class="small text-muted">PIN ANDA</div>
+    <div class="pin-nombor">{{ pin }}</div>
+    <div class="small"><b>Jangan kongsi PIN ini.</b></div>
+  </div>
+  <p class="small mt-3 mb-1">Apabila surat siap, ambil di kaunter bersama kad matrik / kad staf,
+    kemudian layari:</p>
+  <p class="fw-bold mb-1">{{ laman }}</p>
+  <img src="{{ url_for('qr_laman') }}" alt="QR" width="130">
+  <p class="small text-muted mb-0">Masukkan No. Pelajar/Staf + PIN untuk mengesahkan pengambilan.</p>
+ </div></div>
+ <div class="d-print-none mt-3 d-flex gap-2">
+   <button class="btn btn-primary" data-print>🖨️ Cetak Slip</button>
+   <a class="btn btn-outline-secondary" href="{{ url_for('admin') }}">Selesai</a>
+   <a class="btn btn-outline-primary" href="{{ url_for('admin_tambah') }}">➕ Tambah Lagi</a>
+ </div>
+</div></div>
+{% endblock %}"""
+
+TEMPLATES["poster.html"] = """{% extends 'base.html' %}
+{% block content %}
+<div class="row justify-content-center"><div class="col-lg-6 text-center">
+ <div class="card shadow-sm"><div class="card-body py-4">
+  {% if ADA_LOGO %}<img src="{{ url_for('static', filename='img/logo.png') }}" alt="" height="80" class="mb-2"><br>{% endif %}
+  <h4>SEMAK &amp; SAHKAN SURAT ANDA</h4>
+  <div class="mb-2">Pejabat Rektor UiTM Cawangan Sabah</div>
+  <img src="{{ url_for('qr_laman') }}" alt="QR" width="260">
+  <p class="fw-bold mt-2 mb-1">{{ laman }}</p>
+  <p class="small text-muted mb-0">Imbas QR, masukkan No. Pelajar/Staf untuk semak status.<br>
+    Ambil surat? Sediakan PIN pada slip anda.</p>
+ </div></div>
+ <button class="btn btn-primary mt-3 d-print-none" data-print>🖨️ Cetak Poster</button>
+</div></div>
 {% endblock %}"""
 
 TEMPLATES["login.html"] = """{% extends 'base.html' %}
@@ -1078,11 +1249,22 @@ TEMPLATES["admin.html"] = """{% extends 'base.html' %}
       {% if s.tandatangan %}<br><img src="{{ s.tandatangan }}" alt="tandatangan" style="height:40px;border:1px solid #ddd;background:#fff">{% endif %}
     {% elif s.status == 'Surat Keluar' %}
       <span class="text-primary">Menunggu pengesahan</span><br>
-      <a class="small" target="_blank" rel="noopener" href="{{ url_for('admin_qr', sid=s.id) }}">QR kaunter</a>
-    {% else %}<span class="text-muted">-</span>{% endif %}
+      {% if s.ada_pin %}<small class="text-success">🔑 PIN telah dijana</small>
+      {% else %}<small class="text-danger">⚠️ Tiada PIN, tekan 🔑 PIN</small>{% endif %}
+      <div class="small text-muted">Semak kad matrik/staf penerima</div>
+    {% else %}
+      <span class="text-muted">-</span>
+      {% if not s.ada_pin %}<br><small class="text-danger">⚠️ Tiada PIN</small>{% endif %}
+    {% endif %}
   </td>
   <td class="text-nowrap">
     <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin_edit', sid=s.id) }}">Edit</a>
+    {% if s.status != 'Selesai' %}
+    <form class="d-inline" method="post" action="{{ url_for('admin_pin', sid=s.id) }}"
+          data-confirm="Jana PIN baharu untuk surat {{ s.no_siri }}? PIN lama tidak sah lagi.">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+      <button class="btn btn-sm btn-outline-warning">🔑 PIN</button></form>
+    {% endif %}
     <form class="d-inline" method="post" action="{{ url_for('admin_padam', sid=s.id) }}"
           data-confirm="Padam rekod {{ s.no_siri }}?">
       <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
@@ -1100,6 +1282,8 @@ TEMPLATES["borang.html"] = """{% extends 'base.html' %}
 <div class="row justify-content-center"><div class="col-lg-7">
 <div class="card shadow-sm"><div class="card-body">
  <h4>{{ tajuk }}</h4>
+ {% if not sid %}<div class="alert alert-info py-2 small">Selepas simpan, <b>PIN {{ PIN_PANJANG }} digit</b>
+   dijana automatik dan <b>slip PIN</b> dipaparkan untuk diserahkan kepada pemohon.</div>{% endif %}
  <form method="post" enctype="multipart/form-data" class="row g-3">
   <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
   <div class="col-md-4"><label class="form-label">No. Siri *</label>
